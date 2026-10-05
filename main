@@ -1,246 +1,729 @@
 # ==============================================================================
-# SCRIPT 1: DEMOGRAPHICS & CLINICAL CHARACTERISTICS PROFILE
+# PD-HRV: RESTING HRV, FREEZING OF GAIT & ANXIETY - INTEGRATED ANALYSIS PIPELINE
 # ==============================================================================
-# - Merges Demographics, Cognitive, Motor UPDRS, and Questionnaires
-# - Generates Table 1 (All Participants and Excluding P-007) via gtsummary
-# - Produces clinical cut-off boxplots with individual jitter points
-# - Prints a participant-by-participant missing data audit to the terminal
+# 1. Data integration & preprocessing
+#    - HRV (08_HRV_Final.xlsx, sheet Reconstructed_30; 5-min standing; P-007 dropped)
+#    - Objective % Time Frozen from ELAN annotations (07_Giladi_Annotated.csv)
+#    - Demographics, UPDRS-III, Giladi clinical ratings, in-lab & home questionnaires
+#    - Stage 1 distributional screening (Shapiro-Wilk, skewness) + log-transform
+# 2. Objective 1 - Baseline prediction of FOG in OFF
+#    - Zero-order correlations, hierarchical regression, diagnostics,
+#      robust/trimmed sensitivity, median-split group contrasts
+# 3. Objective 2 - Within-subject levodopa modulation (OFF vs ON)
+#    - Paired t / Wilcoxon, Cohen's dz, delta coupling, Mahalanobis screening
+# 4. Objective 3 - Disentangling motor propensity from anxiety
+#    - HRV x anxiety correlations, anxiety-adjusted hierarchical regressions,
+#      High vs Low anxiety cohort contrasts
+# 5. Publication figures (ggplot2, 300 DPI) exported to Results/
+# ==============================================================================
+# Paths can be overridden without editing the script:
+#   PD_HRV_DATA_DIR=/path/to/Data PD_HRV_RESULTS_DIR=/path/to/Results Rscript main
 # ==============================================================================
 
 # 1. Packages ------------------------------------------------------------------
-needed_pkgs <- c("readxl", "tidyverse", "lubridate", "gtsummary", 
-                 "RColorBrewer", "gridExtra", "grid")
+needed_pkgs <- c("readxl", "tidyverse", "RColorBrewer", "lmtest", "car", "MASS")
 to_install <- needed_pkgs[!vapply(needed_pkgs, requireNamespace, logical(1), quietly = TRUE)]
 if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
 
+# MASS and car are called with :: so they do not mask dplyr::select / recode
 suppressPackageStartupMessages({
   library(readxl)
   library(tidyverse)
-  library(lubridate)
-  library(gtsummary)
   library(RColorBrewer)
-  library(gridExtra)
-  library(grid)
+  library(lmtest)
 })
 
+set.seed(2026)
+options(width = 160, dplyr.summarise.inform = FALSE)
+
 # 2. File Paths ----------------------------------------------------------------
-DATA_DIR <- "/Users/aecasagr/Desktop/PD_HRV/Data"
+DATA_DIR    <- Sys.getenv("PD_HRV_DATA_DIR", "/Users/aecasagr/Desktop/PD_HRV/Data")
+RESULTS_DIR <- Sys.getenv("PD_HRV_RESULTS_DIR", file.path(dirname(DATA_DIR), "Results"))
+dir.create(RESULTS_DIR, showWarnings = FALSE, recursive = TRUE)
+
 F_DEMO   <- file.path(DATA_DIR, "01_Demographics.xlsx")
-F_COG    <- file.path(DATA_DIR, "02_Cognitive.xlsx")
 F_UPDRS  <- file.path(DATA_DIR, "03_Motor_UPDRS-III.xlsx")
 F_GILADI <- file.path(DATA_DIR, "04_Freezing_Giladi.xlsx")
+F_INLAB  <- file.path(DATA_DIR, "05_InLab_Questionnaires.xlsx")
 F_HOME   <- file.path(DATA_DIR, "06_Home_Questionnaires.xlsx")
+F_FOGANN <- file.path(DATA_DIR, "07_Giladi_Annotated.csv")
+F_HRV    <- file.path(DATA_DIR, "08_HRV_Final.xlsx")
 
-# 3. Load & Process ------------------------------------------------------------
-cat("\n============================================================\n")
-cat(" LOADING & MERGING DEMOGRAPHIC & CLINICAL DATA\n")
-cat("============================================================\n")
+missing_files <- c(F_DEMO, F_UPDRS, F_GILADI, F_INLAB, F_HOME, F_FOGANN, F_HRV)
+missing_files <- missing_files[!file.exists(missing_files)]
+if (length(missing_files)) stop("Missing input file(s):\n  ", paste(missing_files, collapse = "\n  "))
 
-# Demographics (drop summary rows by matching PID format P-XXX)
-raw_demo <- read_excel(F_DEMO, sheet = "Demographics") %>%
-  filter(grepl("^P-\\d{3}$", participant_id)) %>%
-  rename(Participant_ID = participant_id)
+# Analysis constants
+EXCLUDE_PIDS        <- c("P-007")              # no ON session / protocol exclusion
+DELTA_A_PRIORI_PIDS <- c("P-001", "P-028")     # a-priori bivariate delta outlier checks
+ANX_CUTOFFS         <- c(STAI_Trait = 40, STAI_State_OFF = 40, HADS_A = 8)
+ALPHA               <- 0.05
 
-# Cognitive
-raw_cog <- read_excel(F_COG, sheet = "Cognitive") %>%
-  filter(grepl("^P-\\d{3}$", participant_id)) %>%
-  rename(Participant_ID = participant_id)
+# 3. Helpers -------------------------------------------------------------------
+banner <- function(txt) {
+  line <- strrep("=", 72)
+  cat("\n\n", line, "\n ", txt, "\n", line, "\n", sep = "")
+}
+section <- function(txt) cat("\n=== ", txt, " ===\n", sep = "")
 
-# UPDRS-III
-raw_updrs <- read_excel(F_UPDRS, sheet = "UPDRS-III") %>%
-  filter(grepl("^P-\\d{3}$", participant_id)) %>%
-  rename(Participant_ID = participant_id)
+fmt_p <- function(p) ifelse(is.na(p), "NA", ifelse(p < .001, "<.001", sprintf("%.3f", p)))
+sig   <- function(p) ifelse(is.na(p), "", ifelse(p < .001, "***", ifelse(p < .01, "**", ifelse(p < .05, "*", ""))))
 
-# Clinical Giladi Summary
-raw_giladi <- read_excel(F_GILADI, sheet = "Summary") %>%
-  filter(grepl("^P-\\d{3}$", participant_id)) %>%
-  rename(Participant_ID = participant_id)
+# Print a tibble with p-value columns formatted and other numerics rounded
+print_tbl <- function(x, digits = 3) {
+  if ("Note" %in% names(x) && all(is.na(x$Note) | x$Note == "")) x <- select(x, -Note)
+  x %>%
+    mutate(across(matches("(^p$|_p$|^p_)") & where(is.numeric), fmt_p)) %>%
+    mutate(across(where(is.numeric), ~ round(.x, digits))) %>%
+    as.data.frame() %>%
+    print(row.names = FALSE)
+  invisible(x)
+}
 
-# Home Questionnaires
-raw_home <- read_excel(F_HOME, sheet = "Summary") %>%
-  filter(grepl("^P-\\d{3}$", participant_id)) %>%
-  rename(Participant_ID = participant_id)
+is_pid   <- function(x) grepl("^P-\\d{3}$", x)
+num      <- function(x) suppressWarnings(as.numeric(x))
 
-# Merge Master Demographic Dataset
-df_demo <- raw_demo %>%
+# Adjusted Fisher-Pearson skewness (G1; matches SPSS / e1071 type 2)
+skew_g1 <- function(x) {
+  x <- x[!is.na(x)]; n <- length(x)
+  if (n < 3 || sd(x) == 0) return(NA_real_)
+  m <- mean(x)
+  g1 <- (sum((x - m)^3) / n) / (sum((x - m)^2) / n)^1.5
+  g1 * sqrt(n * (n - 1)) / (n - 2)
+}
+
+safe_shapiro <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) < 3 || length(unique(x)) < 3) return(c(W = NA_real_, p = NA_real_))
+  s <- shapiro.test(x)
+  c(W = unname(s$statistic), p = s$p.value)
+}
+
+# Zero-order Pearson + Spearman for one pair of variables
+cor_pair <- function(df, x, y) {
+  d <- df %>% select(all_of(c(x, y))) %>% drop_na()
+  if (nrow(d) < 4) return(tibble(X = x, Y = y, n = nrow(d)))
+  pr <- cor.test(d[[x]], d[[y]], method = "pearson")
+  sp <- suppressWarnings(cor.test(d[[x]], d[[y]], method = "spearman", exact = FALSE))
+  tibble(X = x, Y = y, n = nrow(d),
+         r = unname(pr$estimate), r_CI_lo = pr$conf.int[1], r_CI_hi = pr$conf.int[2],
+         r_p = pr$p.value, rho = unname(sp$estimate), rho_p = sp$p.value,
+         sig_r = sig(pr$p.value), sig_rho = sig(sp$p.value))
+}
+
+# Two-group contrast: Student t, Welch t, Mann-Whitney U, Cohen's d
+compare_groups <- function(df, group, outcome) {
+  d <- df %>% select(Participant_ID, g = all_of(group), y = all_of(outcome)) %>% drop_na()
+  d$g <- droplevels(factor(d$g))
+  ns <- table(d$g)
+  base <- tibble(Grouping = group, Outcome = outcome,
+                 n_g1 = if (length(ns) >= 1) as.integer(ns[1]) else 0L,
+                 n_g2 = if (length(ns) >= 2) as.integer(ns[2]) else 0L,
+                 Groups = paste(levels(d$g), collapse = " vs "))
+  if (length(ns) < 2 || any(ns < 2)) return(base %>% mutate(Note = "Insufficient group sizes"))
+  y1 <- d$y[d$g == levels(d$g)[1]]; y2 <- d$y[d$g == levels(d$g)[2]]
+  st <- t.test(y ~ g, data = d, var.equal = TRUE)
+  wt <- t.test(y ~ g, data = d, var.equal = FALSE)
+  mw <- wilcox.test(y ~ g, data = d, exact = FALSE)
+  sp <- sqrt(((length(y1) - 1) * var(y1) + (length(y2) - 1) * var(y2)) / (length(y1) + length(y2) - 2))
+  base %>% mutate(
+    M_g1 = mean(y1), SD_g1 = sd(y1), M_g2 = mean(y2), SD_g2 = sd(y2),
+    Student_t = unname(st$statistic), Student_df = unname(st$parameter), Student_p = st$p.value,
+    Welch_t = unname(wt$statistic), Welch_df = unname(wt$parameter), Welch_p = wt$p.value,
+    MWU_U = unname(mw$statistic), MWU_p = mw$p.value,
+    Cohen_d = (mean(y1) - mean(y2)) / sp,
+    Note = ""
+  )
+}
+
+# Coefficient table with standardized betas
+coef_table <- function(m) {
+  d <- model.frame(m)
+  dz <- as.data.frame(scale(d))
+  mz <- lm(formula(m), data = dz)
+  ct <- summary(m)$coefficients
+  tibble(Term = rownames(ct), B = ct[, 1], SE = ct[, 2],
+         Beta = c(NA, coef(mz)[-1]), t = ct[, 3], p = ct[, 4], sig = sig(ct[, 4]))
+}
+
+# Two-step hierarchical linear regression on a common complete-case sample
+run_hlr <- function(df, outcome, step1, step2, label, verbose = TRUE) {
+  d <- df %>% select(Participant_ID, all_of(c(outcome, step1, step2))) %>% drop_na()
+  k2 <- length(step1) + length(step2)
+  if (nrow(d) < k2 + 3) {
+    cat(sprintf("  [%s] Skipped: n = %d too small for %d predictors.\n", label, nrow(d), k2))
+    return(NULL)
+  }
+  m1 <- lm(reformulate(step1, outcome), data = d)
+  m2 <- lm(reformulate(c(step1, step2), outcome), data = d)
+  a  <- anova(m1, m2)
+  s1 <- summary(m1); s2 <- summary(m2)
+  fstat <- function(s) unname(s$fstatistic)
+  fp    <- function(s) { f <- s$fstatistic; pf(f[1], f[2], f[3], lower.tail = FALSE) }
+  fit <- tibble(
+    Model = label, Step = c("Step 1", "Step 2"), n = nrow(d),
+    Predictors = c(paste(step1, collapse = " + "), paste(c(step1, step2), collapse = " + ")),
+    R2 = c(s1$r.squared, s2$r.squared), Adj_R2 = c(s1$adj.r.squared, s2$adj.r.squared),
+    F = c(fstat(s1)[1], fstat(s2)[1]), df1 = c(fstat(s1)[2], fstat(s2)[2]),
+    df2 = c(fstat(s1)[3], fstat(s2)[3]), F_p = c(fp(s1), fp(s2)),
+    dR2 = c(s1$r.squared, s2$r.squared - s1$r.squared),
+    F_change = c(fstat(s1)[1], a$F[2]),
+    df_change = c(fstat(s1)[2], a$Df[2]),
+    F_change_p = c(fp(s1), a$`Pr(>F)`[2])
+  )
+  if (verbose) {
+    section(sprintf("%s | Outcome: %s | n = %d", label, outcome, nrow(d)))
+    cat("Step 1 coefficients:\n");  print_tbl(coef_table(m1))
+    cat("\nStep 2 coefficients:\n"); print_tbl(coef_table(m2))
+    cat("\nModel fit & change statistics:\n")
+    print_tbl(fit %>% select(-Model, -Predictors))
+  }
+  list(label = label, outcome = outcome, data = d, m1 = m1, m2 = m2, fit = fit)
+}
+
+# Post-estimation assumption checks for a fitted lm
+diag_lm <- function(m, d, label, verbose = TRUE) {
+  res <- residuals(m)
+  sw  <- shapiro.test(res)
+  bp  <- lmtest::bptest(m)
+  n_pred <- length(coef(m)) - 1
+  vifs <- if (n_pred >= 2) car::vif(m) else c(NA_real_)
+  cd  <- cooks.distance(m)
+  thr <- 4 / nrow(d)
+  flagged <- d$Participant_ID[cd > thr]
+  out <- tibble(
+    Model = label, n = nrow(d),
+    SW_W = unname(sw$statistic), SW_p = sw$p.value,
+    Normality = ifelse(sw$p.value >= ALPHA, "PASS", "VIOLATED"),
+    BP = unname(bp$statistic), BP_p = bp$p.value,
+    Homoscedasticity = ifelse(bp$p.value >= ALPHA, "PASS", "VIOLATED"),
+    Max_VIF = max(vifs), Collinearity = ifelse(is.na(max(vifs)), "n/a (1 predictor)",
+                                               ifelse(max(vifs) < 5, "PASS", "CONCERN (VIF >= 5)")),
+    Cook_thr = thr, n_Cook_flag = length(flagged),
+    Cook_flagged = ifelse(length(flagged), paste(flagged, collapse = ", "), "none")
+  )
+  if (verbose) {
+    section(sprintf("Assumption checks: %s", label))
+    cat(sprintf("  Residual normality (Shapiro-Wilk): W = %.3f, p = %s -> %s\n",
+                sw$statistic, fmt_p(sw$p.value), out$Normality))
+    cat(sprintf("  Homoscedasticity (Breusch-Pagan):  BP = %.3f, df = %d, p = %s -> %s\n",
+                bp$statistic, as.integer(bp$parameter), fmt_p(bp$p.value), out$Homoscedasticity))
+    if (n_pred >= 2) {
+      cat("  Collinearity (VIF):\n")
+      print_tbl(tibble(Term = names(vifs), VIF = unname(vifs)))
+    }
+    cat(sprintf("  Collinearity verdict: %s\n", out$Collinearity))
+    cat(sprintf("  Cook's distance (threshold 4/n = %.3f): %d flagged -> %s\n",
+                thr, length(flagged), out$Cook_flagged))
+    if (any(cd > 1)) cat(sprintf("  ** Highly influential (D > 1): %s\n",
+                                 paste(d$Participant_ID[cd > 1], collapse = ", ")))
+    cook_tbl <- tibble(Participant_ID = d$Participant_ID, Cooks_D = cd,
+                       Leverage = hatvalues(m), Std_Resid = rstandard(m)) %>%
+      arrange(desc(Cooks_D)) %>% slice_head(n = 5)
+    cat("  Top-5 influence diagnostics:\n"); print_tbl(cook_tbl)
+  }
+  list(summary = out, cooks = cd, flagged = flagged)
+}
+
+# Huber M-estimation with approximate p-values (t on residual df)
+robust_fit <- function(formula, d) {
+  rm <- MASS::rlm(formula, data = d, psi = MASS::psi.huber, maxit = 200)
+  ct <- summary(rm)$coefficients
+  dfr <- nrow(d) - nrow(ct)
+  tibble(Term = rownames(ct), B = ct[, 1], SE = ct[, 2], t = ct[, 3],
+         p = 2 * pt(-abs(ct[, 3]), dfr), sig = sig(2 * pt(-abs(ct[, 3]), dfr)))
+}
+
+# Paired OFF vs ON contrast
+paired_contrast <- function(df, var_off, var_on, label) {
+  d <- df %>% select(Participant_ID, OFF = all_of(var_off), ON = all_of(var_on)) %>% drop_na()
+  diff <- d$ON - d$OFF
+  sw <- safe_shapiro(diff)
+  pt_ <- t.test(d$ON, d$OFF, paired = TRUE)
+  wx  <- wilcox.test(d$ON, d$OFF, paired = TRUE, exact = FALSE)
+  tibble(
+    Variable = label, n_pairs = nrow(d),
+    M_OFF = mean(d$OFF), SD_OFF = sd(d$OFF), M_ON = mean(d$ON), SD_ON = sd(d$ON),
+    M_Diff = mean(diff), SD_Diff = sd(diff),
+    Diff_SW_W = sw[["W"]], Diff_SW_p = sw[["p"]],
+    Diff_Normal = ifelse(is.na(sw[["p"]]), "n/a", ifelse(sw[["p"]] >= ALPHA, "YES", "NO")),
+    t = unname(pt_$statistic), df = unname(pt_$parameter), t_p = pt_$p.value,
+    Cohen_dz = mean(diff) / sd(diff),
+    W = unname(wx$statistic), W_p = wx$p.value,
+    Primary_Test = ifelse(!is.na(sw[["p"]]) & sw[["p"]] < ALPHA, "Wilcoxon", "Paired t")
+  )
+}
+
+# 4. Load & Process ------------------------------------------------------------
+banner("STAGE 0: LOADING & MERGING SOURCE DATA")
+
+## 4a. HRV - Reconstructed_30, resting 5-min standing trials only
+raw_hrv <- read_excel(F_HRV, sheet = "Reconstructed_30", skip = 1)
+hrv_long <- raw_hrv %>%
+  filter(is_pid(Participant),
+         grepl("5min_Standing", Trial, ignore.case = TRUE),
+         !Participant %in% EXCLUDE_PIDS) %>%
   transmute(
-    Participant_ID,
-    Sex = factor(`Gender (self-report)`),
-    Age = as.numeric(`Age (years)`),
-    Disease_Duration = as.numeric(`Disease duration (years since diagnosis)`),
-    Symptom_Duration = as.numeric(`Symptom duration (years)`),
-    LEDD = as.numeric(LEDD_total_mg),
-    BMI = as.numeric(`BMI (kg/m2)`)
+    Participant_ID = Participant,
+    State     = toupper(Condition),
+    HR        = num(HR_Corrected),
+    SDNN      = num(SDNN_Corrected),
+    RMSSD     = num(RMSSD_Corrected),
+    SDSD      = num(SDSD_Corrected),
+    pNN50     = num(pNN50_Corrected),
+    Recon_Pct = num(Reconstructed_Percent)
+  )
+dups <- hrv_long %>% count(Participant_ID, State) %>% filter(n > 1)
+if (nrow(dups)) stop("Duplicate HRV rows per participant/state:\n", paste(capture.output(dups), collapse = "\n"))
+
+hrv_wide <- hrv_long %>%
+  pivot_wider(names_from = State, values_from = c(HR, SDNN, RMSSD, SDSD, pNN50, Recon_Pct), names_sep = "_")
+cat(sprintf("HRV (Reconstructed_30, 5-min standing, excl. %s): %d participants | OFF n = %d | ON n = %d\n",
+            paste(EXCLUDE_PIDS, collapse = ", "), nrow(hrv_wide),
+            sum(!is.na(hrv_wide$RMSSD_OFF)), sum(!is.na(hrv_wide$RMSSD_ON))))
+
+## 4b. Objective freezing - aggregate FOG and trial durations across tasks
+raw_fogann <- read_csv(F_FOGANN, show_col_types = FALSE, name_repair = "unique_quiet")
+fog_obj <- raw_fogann %>%
+  filter(is_pid(Participant_ID)) %>%
+  mutate(State = toupper(State),
+         Trial_Duration_s = num(Trial_Duration_s),
+         Total_FOG_Duration_s = num(Total_FOG_Duration_s)) %>%
+  group_by(Participant_ID, State) %>%
+  summarise(
+    N_Tasks   = sum(!is.na(Trial_Duration_s)),
+    FOG_s     = sum(Total_FOG_Duration_s, na.rm = TRUE),
+    Trial_s   = sum(Trial_Duration_s, na.rm = TRUE),
+    Pct_Frozen = 100 * FOG_s / Trial_s
   ) %>%
-  left_join(raw_cog %>% transmute(
-    Participant_ID,
-    MoCA = as.numeric(`MoCA (/30)`),
-    TMT_A = as.numeric(`TMT-A (s)`),
-    TMT_B = as.numeric(`TMT-B (s)`),
-    dTMT  = as.numeric(`TMT B - A (s)`)
-  ), by = "Participant_ID") %>%
-  left_join(raw_updrs %>% transmute(
-    Participant_ID,
-    UPDRS_OFF = as.numeric(`UPDRS-III OFF`),
-    UPDRS_ON  = as.numeric(`UPDRS-III ON`)
-  ), by = "Participant_ID") %>%
-  left_join(raw_giladi %>% transmute(
-    Participant_ID,
-    Giladi_OFF = as.numeric(`OFF Total sum`),
-    Giladi_ON  = as.numeric(`ON Total sum`)
-  ), by = "Participant_ID") %>%
-  left_join(raw_home %>% transmute(
-    Participant_ID,
-    NFOG_Q = as.numeric(`NFOG-Q total`),
-    STAI_Trait = as.numeric(`STAI-Trait total`)
-  ), by = "Participant_ID")
+  ungroup() %>%
+  pivot_wider(names_from = State, values_from = c(N_Tasks, FOG_s, Trial_s, Pct_Frozen), names_sep = "_")
+cat(sprintf("Objective FOG annotations: %d participants (tasks/session: OFF %s, ON %s)\n",
+            nrow(fog_obj),
+            paste(range(fog_obj$N_Tasks_OFF, na.rm = TRUE), collapse = "-"),
+            paste(range(fog_obj$N_Tasks_ON, na.rm = TRUE), collapse = "-")))
 
-cat(sprintf("Loaded %d participants from demographic roster.\n", nrow(df_demo)))
+## 4c. Clinical sources (drop summary rows by matching PID format P-XXX)
+read_pid_sheet <- function(path, sheet) {
+  read_excel(path, sheet = sheet) %>%
+    filter(is_pid(participant_id)) %>%
+    rename(Participant_ID = participant_id)
+}
 
-# 4. Generate Table 1 (gtsummary) ---------------------------------------------
-theme_gtsummary_journal(journal = "jama")
+demo <- read_pid_sheet(F_DEMO, "Demographics") %>%
+  transmute(Participant_ID,
+            Disease_Duration = num(`Disease duration (years since diagnosis)`),
+            LEDD = num(LEDD_total_mg))
 
-table_types <- list(
-  c(Age, Disease_Duration, Symptom_Duration, LEDD, BMI, MoCA, 
-    TMT_A, TMT_B, dTMT, UPDRS_OFF, UPDRS_ON, Giladi_OFF, Giladi_ON, 
-    NFOG_Q, STAI_Trait) ~ "continuous"
-)
+updrs <- read_pid_sheet(F_UPDRS, "UPDRS-III") %>%
+  transmute(Participant_ID,
+            UPDRS_OFF = num(`UPDRS-III OFF`),
+            UPDRS_ON  = num(`UPDRS-III ON`))
 
-table_labels <- list(
-  Sex ~ "Sex",
-  Age ~ "Age (years)",
-  Disease_Duration ~ "Disease Duration (years)",
-  Symptom_Duration ~ "Symptom Duration (years)",
-  LEDD ~ "Total LEDD (mg/day)",
-  BMI ~ "BMI (kg/m²)",
-  MoCA ~ "MoCA Score (/30)",
-  TMT_A ~ "Trail Making Test A (s)",
-  TMT_B ~ "Trail Making Test B (s)",
-  dTMT ~ "TMT B − A (ΔTMT, s)",
-  UPDRS_OFF ~ "MDS-UPDRS Part III (OFF Med)",
-  UPDRS_ON ~ "MDS-UPDRS Part III (ON Med)",
-  Giladi_OFF ~ "Giladi FOG Total Sum (OFF)",
-  Giladi_ON ~ "Giladi FOG Total Sum (ON)",
-  NFOG_Q ~ "NFOG-Q Total Score",
-  STAI_Trait ~ "STAI-Trait Anxiety Score"
-)
+giladi <- read_pid_sheet(F_GILADI, "Summary") %>%
+  transmute(Participant_ID,
+            Giladi_OFF = num(`OFF Total sum`),
+            Giladi_ON  = num(`ON Total sum`))
 
-stat_template <- "{mean} ± {sd} (SE: {se}); Range: {min} – {max}"
+inlab <- read_pid_sheet(F_INLAB, "Summary") %>%
+  transmute(Participant_ID,
+            STAI_State_OFF = num(`STAI-State OFF`),
+            STAI_State_ON  = num(`STAI-State ON`))
 
-table_1_all <- df_demo %>%
+home <- read_pid_sheet(F_HOME, "Summary") %>%
+  transmute(Participant_ID,
+            NFOG_Q     = num(`NFOG-Q total`),
+            STAI_Trait = num(`STAI-Trait total`),
+            HADS_A     = num(`HADS-A`))
+
+## 4d. Master merge - analytic cohort defined by valid resting HRV
+df <- hrv_wide %>%
+  left_join(fog_obj %>% select(Participant_ID, Pct_Frozen_OFF, Pct_Frozen_ON), by = "Participant_ID") %>%
+  left_join(demo,   by = "Participant_ID") %>%
+  left_join(updrs,  by = "Participant_ID") %>%
+  left_join(giladi, by = "Participant_ID") %>%
+  left_join(inlab,  by = "Participant_ID") %>%
+  left_join(home,   by = "Participant_ID") %>%
+  arrange(Participant_ID)
+
+roster <- sort(unique(c(demo$Participant_ID, updrs$Participant_ID, home$Participant_ID, fog_obj$Participant_ID)))
+not_in_hrv <- setdiff(roster, df$Participant_ID)
+cat(sprintf("Clinical roster: %d participants | Analytic HRV cohort: n = %d\n", length(roster), nrow(df)))
+cat(sprintf("Not in analytic cohort (excluded or no valid Reconstructed_30 HRV): %s\n",
+            ifelse(length(not_in_hrv), paste(not_in_hrv, collapse = ", "), "none")))
+
+section("Missing data audit (analytic cohort)")
+df %>%
   select(-Participant_ID) %>%
-  tbl_summary(
-    statistic = list(all_continuous() ~ stat_template, all_categorical() ~ "{n} ({p}%)"),
-    type = table_types, label = table_labels, missing_text = "Missing"
-  ) %>%
-  modify_header(label = "**Characteristic**") %>%
-  modify_caption("**Table 1. Demographic & Clinical Characteristics (All Participants)**") %>%
-  bold_labels()
-
-table_1_filtered <- df_demo %>%
-  filter(Participant_ID != "P-007") %>%
-  select(-Participant_ID) %>%
-  tbl_summary(
-    statistic = list(all_continuous() ~ stat_template, all_categorical() ~ "{n} ({p}%)"),
-    type = table_types, label = table_labels, missing_text = "Missing"
-  ) %>%
-  modify_header(label = "**Characteristic**") %>%
-  modify_caption("**Table 1. Demographic & Clinical Characteristics (Excluding P-007)**") %>%
-  bold_labels()
-
-# Print Table 1 to terminal
-cat("\n\n============================================================\n")
-cat(" TABLE 1: DEMOGRAPHICS (ALL PARTICIPANTS)\n")
-cat("============================================================\n")
-print(as_tibble(table_1_all), n = Inf, width = Inf)
-
-cat("\n\n============================================================\n")
-cat(" TABLE 1: DEMOGRAPHICS (EXCLUDING P-007)\n")
-cat("============================================================\n")
-print(as_tibble(table_1_filtered), n = Inf, width = Inf)
-
-# 5. Missing Data Audit --------------------------------------------------------
-cat("\n\n============================================================\n")
-cat(" MISSING DATA AUDIT BY VARIABLE\n")
-cat("============================================================\n")
-missing_audit <- df_demo %>%
-  filter(Participant_ID != "P-007") %>%
+  mutate(across(everything(), as.character)) %>%
+  bind_cols(Participant_ID = df$Participant_ID) %>%
   pivot_longer(-Participant_ID, names_to = "Variable", values_to = "Val") %>%
   group_by(Variable) %>%
-  summarise(
-    Missing_Count = sum(is.na(Val)),
-    Missing_PIDs  = ifelse(any(is.na(Val)), paste(Participant_ID[is.na(Val)], collapse = ", "), "Complete"),
-    .groups = "drop"
-  )
-print(as.data.frame(missing_audit), row.names = FALSE)
+  summarise(n_valid = sum(!is.na(Val)), n_missing = sum(is.na(Val)),
+            Missing_PIDs = ifelse(any(is.na(Val)), paste(Participant_ID[is.na(Val)], collapse = ", "), "Complete")) %>%
+  filter(n_missing > 0 | Variable %in% c("RMSSD_OFF", "Pct_Frozen_OFF")) %>%
+  print_tbl()
 
-# 6. Clinical Cutoff Boxplots with Individual Data Points ----------------------
-plot_vars <- c(
-  Age = "Age\n(years)",
-  Disease_Duration = "Disease Duration\n(years)",
-  LEDD = "Total LEDD\n(mg/day)",
-  MoCA = "MoCA Score\n(ON Med)",
-  TMT_A = "TMT-A\n(seconds)",
-  TMT_B = "TMT-B\n(seconds)",
-  dTMT = "TMT B−A\n(ΔTMT, s)",
-  UPDRS_OFF = "UPDRS-III\n(OFF Med)",
-  UPDRS_ON = "UPDRS-III\n(ON Med)",
-  NFOG_Q = "NFOG-Q\n(Total)",
-  STAI_Trait = "STAI-Trait\n(Total)"
+# 5. Stage 1 Distributional Screening & Transformation --------------------------
+banner("STAGE 1: DISTRIBUTIONAL SCREENING (Shapiro-Wilk & Skewness)")
+
+screen_vars <- c("HR_OFF", "HR_ON", "SDNN_OFF", "SDNN_ON", "RMSSD_OFF", "RMSSD_ON", "SDSD_OFF", "SDSD_ON",
+                 "pNN50_OFF", "pNN50_ON", "Pct_Frozen_OFF", "Pct_Frozen_ON", "NFOG_Q",
+                 "Giladi_OFF", "Giladi_ON", "UPDRS_OFF", "UPDRS_ON", "Disease_Duration", "LEDD",
+                 "STAI_Trait", "STAI_State_OFF", "STAI_State_ON", "HADS_A")
+
+screen <- function(df, vars) {
+  map_dfr(vars, function(v) {
+    x <- df[[v]]; sw <- safe_shapiro(x); sk <- skew_g1(x)
+    tibble(Variable = v, n = sum(!is.na(x)), Mean = mean(x, na.rm = TRUE), SD = sd(x, na.rm = TRUE),
+           Median = median(x, na.rm = TRUE), Skew = sk, SW_W = sw[["W"]], SW_p = sw[["p"]],
+           Verdict = case_when(is.na(sw[["p"]]) ~ "n/a",
+                               sw[["p"]] >= ALPHA & abs(sk) < 1 ~ "Approx. normal",
+                               sk >= 1 ~ "Non-normal: RIGHT-skewed",
+                               sk <= -1 ~ "Non-normal: LEFT-skewed",
+                               TRUE ~ "Non-normal"))
+  })
+}
+screen_raw <- screen(df, screen_vars)
+print_tbl(screen_raw)
+
+section("Natural-log transformation of time-domain HRV")
+td_hrv <- c("SDNN", "RMSSD", "SDSD")
+for (v in td_hrv) for (s in c("OFF", "ON")) {
+  df[[paste0("log", v, "_", s)]] <- log(df[[paste0(v, "_", s)]])
+}
+td_screen <- screen_raw %>% filter(str_detect(Variable, paste0("^(", paste(td_hrv, collapse = "|"), ")_")))
+cat("Pre-transform skewness of time-domain HRV (skew > 0.5 or SW p < .05 => right-skew justification):\n")
+print_tbl(td_screen %>%
+            mutate(Right_Skewed = ifelse(Skew > 0.5 | (SW_p < ALPHA & Skew > 0), "YES", "no")) %>%
+            select(Variable, n, Skew, SW_p, Right_Skewed))
+cat("\nPost-transform screening (ln):\n")
+screen_log <- screen(df, paste0("log", rep(td_hrv, each = 2), "_", c("OFF", "ON")))
+print_tbl(screen_log)
+cat("\nNote: logRMSSD is the protocol-specified parametric HRV predictor and is used in all models.\n")
+nn_fog <- screen_raw %>% filter(Variable %in% c("Pct_Frozen_OFF", "Pct_Frozen_ON"), SW_p < ALPHA)
+if (nrow(nn_fog)) cat(sprintf("Note: %s non-normal; non-parametric counterparts are reported alongside parametric tests.\n",
+                              paste(nn_fog$Variable, collapse = ", ")))
+
+write_csv(df, file.path(RESULTS_DIR, "Analysis_Dataset_Merged.csv"))
+
+# 6. Plotting setup ------------------------------------------------------------
+pids <- sort(unique(df$Participant_ID))
+pid_cols <- setNames(colorRampPalette(brewer.pal(12, "Paired"))(length(pids)), pids)
+
+theme_pub <- function(base = 11) {
+  theme_bw(base_size = base) +
+    theme(plot.title = element_text(face = "bold", size = base + 2, hjust = 0.5),
+          plot.subtitle = element_text(size = base - 1.5, hjust = 0.5, colour = "grey30"),
+          strip.text = element_text(face = "bold", size = base - 1.5),
+          strip.background = element_rect(fill = "grey95"),
+          panel.grid.minor = element_blank(),
+          legend.key.size = unit(0.4, "cm"),
+          legend.text = element_text(size = base - 3),
+          legend.title = element_text(size = base - 2, face = "bold"))
+}
+pid_scale <- function() scale_colour_manual(values = pid_cols, name = "Participant",
+                                            guide = guide_legend(ncol = 2, override.aes = list(size = 2.5)))
+save_fig <- function(p, name, w, h) {
+  f <- file.path(RESULTS_DIR, name)
+  ggsave(f, p, width = w, height = h, dpi = 300, bg = "white")
+  cat(sprintf("  Saved: %s\n", f))
+  if (interactive()) print(p)
+}
+
+var_labels <- c(
+  logRMSSD_OFF = "ln RMSSD (OFF)", SDNN_OFF = "SDNN (OFF, ms)",
+  Pct_Frozen_OFF = "% Time Frozen (OFF)", NFOG_Q = "NFOG-Q Total",
+  Giladi_OFF = "Giladi FOG Sum (OFF)",
+  logRMSSD = "ln RMSSD", RMSSD = "RMSSD (ms)", SDNN = "SDNN (ms)",
+  Pct_Frozen = "% Time Frozen", UPDRS = "MDS-UPDRS III",
+  STAI_Trait = "STAI-Trait", STAI_State_OFF = "STAI-State (OFF)", HADS_A = "HADS-A"
 )
 
-clinical_cutoffs <- tribble(
-  ~Variable, ~ymin, ~ymax, ~Status,
-  "MoCA Score\n(ON Med)", 25.5, Inf, "Normal",
-  "MoCA Score\n(ON Med)", 17.5, 25.5, "Mild",
-  "MoCA Score\n(ON Med)", 9.5, 17.5, "Moderate",
-  "MoCA Score\n(ON Med)", -Inf, 9.5, "Severe",
-  "TMT-A\n(seconds)", -Inf, 39.5, "Normal",
-  "TMT-A\n(seconds)", 39.5, Inf, "Severe",
-  "TMT-B\n(seconds)", -Inf, 91.5, "Normal",
-  "TMT-B\n(seconds)", 91.5, Inf, "Severe",
-  "UPDRS-III\n(OFF Med)", -Inf, 32.5, "Mild",
-  "UPDRS-III\n(OFF Med)", 32.5, 58.5, "Moderate",
-  "UPDRS-III\n(OFF Med)", 58.5, Inf, "Severe",
-  "UPDRS-III\n(ON Med)", -Inf, 32.5, "Mild",
-  "UPDRS-III\n(ON Med)", 32.5, 58.5, "Moderate",
-  "UPDRS-III\n(ON Med)", 58.5, Inf, "Severe"
-) %>%
-  mutate(Variable = factor(Variable, levels = plot_vars),
-         Status = factor(Status, levels = c("Normal", "Mild", "Moderate", "Severe")))
+# 7. OBJECTIVE 1 - Baseline Prediction of FOG in OFF ---------------------------
+banner("OBJECTIVE 1: BASELINE (OFF) HRV AS A PREDICTOR OF FREEZING")
 
-pids <- sort(unique(df_demo$Participant_ID))
-pid_cols <- setNames(colorRampPalette(brewer.pal(min(length(pids), 12), "Paired"))(length(pids)), pids)
+section("Preliminary: zero-order correlations (resting HRV x freezing)")
+cor_obj1 <- expand_grid(X = c("logRMSSD_OFF", "SDNN_OFF"), Y = c("Pct_Frozen_OFF", "NFOG_Q")) %>%
+  pmap_dfr(~ cor_pair(df, .x, .y))
+print_tbl(cor_obj1)
 
-df_plot_long <- df_demo %>%
-  filter(Participant_ID != "P-007") %>%
-  select(Participant_ID, any_of(names(plot_vars))) %>%
-  pivot_longer(-Participant_ID, names_to = "Var_Key", values_to = "Value") %>%
-  filter(!is.na(Value)) %>%
-  mutate(Variable = factor(recode(Var_Key, !!!plot_vars), levels = plot_vars))
+## Primary Aim 1: hierarchical linear regression
+section("Primary Aim 1: Hierarchical linear regression")
+confounders <- c("Disease_Duration", "UPDRS_OFF", "LEDD")
+hlr1 <- run_hlr(df, "Pct_Frozen_OFF", confounders, "logRMSSD_OFF", "Aim 1 HLR (primary)")
+hlr1_nfog <- run_hlr(df, "NFOG_Q", confounders, "logRMSSD_OFF", "Aim 1 HLR (secondary: NFOG-Q)")
 
-p_demo <- ggplot(df_plot_long, aes(x = "", y = Value)) +
-  geom_rect(data = clinical_cutoffs, aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax, fill = Status),
-            inherit.aes = FALSE, alpha = 0.22) +
-  geom_boxplot(outlier.shape = NA, fill = "white", colour = "grey35", width = 0.5, linewidth = 0.5, alpha = 0.8) +
-  geom_jitter(aes(colour = Participant_ID), width = 0.16, size = 2.6, alpha = 0.9, shape = 16) +
-  facet_wrap(~ Variable, scales = "free_y", ncol = 4) +
-  scale_colour_manual(values = pid_cols, name = "Participant") +
-  scale_fill_manual(values = c("Normal" = "#7fc97f", "Mild" = "#ffff99", 
-                               "Moderate" = "#fdc086", "Severe" = "#f0027f"),
-                    name = "Clinical Cutoff", drop = FALSE) +
-  labs(title = "Clinical & Demographic Cohort Distributions (Excluding P-007)",
-       subtitle = "Boxplots represent median & IQR; points display individual participant data",
-       x = NULL, y = "Score / Units") +
-  theme_bw(base_size = 11) +
-  theme(
-    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
-    plot.subtitle = element_text(size = 9.5, hjust = 0.5, colour = "grey30"),
-    axis.text.x = element_blank(),
-    axis.ticks.x = element_blank(),
-    strip.text = element_text(face = "bold", size = 8.5),
-    strip.background = element_rect(fill = "grey95"),
-    panel.grid.major.x = element_blank()
-  )
+if (!is.null(hlr1)) {
+  f2 <- hlr1$fit %>% filter(Step == "Step 2")
+  cat(sprintf("\n>> Adding logRMSSD_OFF: dR2 = %.3f, F_change(%d, %d) = %.3f, p = %s %s\n",
+              f2$dR2, f2$df_change, f2$df2, f2$F_change, fmt_p(f2$F_change_p),
+              ifelse(f2$F_change_p < ALPHA, "-> SIGNIFICANT incremental variance", "-> n.s.")))
 
-print(p_demo)
+  d1 <- diag_lm(hlr1$m2, hlr1$data, "Aim 1 HLR Step 2 (full cohort)")
+
+  ## Dual-track sensitivity: robust regression + trimmed cohort
+  section("Sensitivity track A: Robust regression (Huber M-estimator, full cohort)")
+  rob1 <- robust_fit(formula(hlr1$m2), hlr1$data)
+  print_tbl(rob1)
+  cat("  (p-values approximate: t referenced to residual df)\n")
+
+  section("Sensitivity track B: Trimmed cohort (Cook's D > 4/n removed)")
+  hlr1_trim <- NULL
+  if (length(d1$flagged)) {
+    cat(sprintf("  Removing: %s\n", paste(d1$flagged, collapse = ", ")))
+    hlr1_trim <- run_hlr(df %>% filter(!Participant_ID %in% d1$flagged),
+                         "Pct_Frozen_OFF", confounders, "logRMSSD_OFF", "Aim 1 HLR (trimmed)")
+    if (!is.null(hlr1_trim)) diag_lm(hlr1_trim$m2, hlr1_trim$data, "Aim 1 HLR Step 2 (trimmed)")
+  } else {
+    cat("  No influential cases flagged - trimmed cohort identical to full cohort.\n")
+  }
+
+  section("Sensitivity summary: logRMSSD_OFF effect across tracks")
+  pick <- function(ct) ct %>% filter(Term == "logRMSSD_OFF")
+  sens1 <- bind_rows(
+    pick(coef_table(hlr1$m2)) %>% mutate(Track = "OLS full", n = nrow(hlr1$data),
+                                         dR2 = f2$dR2, F_change_p = f2$F_change_p),
+    pick(rob1) %>% mutate(Track = "Robust (Huber) full", n = nrow(hlr1$data)),
+    if (!is.null(hlr1_trim)) pick(coef_table(hlr1_trim$m2)) %>%
+      mutate(Track = "OLS trimmed", n = nrow(hlr1_trim$data),
+             dR2 = hlr1_trim$fit$dR2[2], F_change_p = hlr1_trim$fit$F_change_p[2])
+  ) %>% select(Track, n, B, SE, t, p, any_of(c("dR2", "F_change_p")))
+  print_tbl(sens1)
+  same_dir <- length(unique(sign(sens1$B))) == 1
+  n_sig    <- sum(sens1$p < ALPHA, na.rm = TRUE)
+  cat(sprintf("  Verdict: direction %s across tracks; significant in %d of %d tracks -> %s\n",
+              ifelse(same_dir, "CONSISTENT", "INCONSISTENT"), n_sig, nrow(sens1),
+              ifelse(!same_dir || !(n_sig %in% c(0, nrow(sens1))), "SENSITIVE to influential cases / estimator",
+                     ifelse(n_sig == 0, "ROBUST (consistently non-significant)", "ROBUST (consistently significant)"))))
+}
+
+## Sub-Aim 1.b: median split on baseline logRMSSD_OFF
+section("Sub-Aim 1.b: Median split on logRMSSD_OFF (Low vs High HRV)")
+med_lr <- median(df$logRMSSD_OFF, na.rm = TRUE)
+df <- df %>% mutate(HRV_Group = factor(ifelse(logRMSSD_OFF > med_lr, "High HRV", "Low HRV"),
+                                       levels = c("Low HRV", "High HRV")))
+cat(sprintf("  Median logRMSSD_OFF = %.3f (RMSSD = %.2f ms) | Low n = %d | High n = %d (ties at median -> Low)\n",
+            med_lr, exp(med_lr), sum(df$HRV_Group == "Low HRV", na.rm = TRUE),
+            sum(df$HRV_Group == "High HRV", na.rm = TRUE)))
+ms1 <- map_dfr(c("Pct_Frozen_OFF", "NFOG_Q", "Giladi_OFF"), ~ compare_groups(df, "HRV_Group", .x))
+print_tbl(ms1 %>% select(-Grouping))
+cat("  (g1 = Low HRV, g2 = High HRV; Cohen's d = (Low - High) / pooled SD)\n")
+
+## Figures - Aim 1
+banner("FIGURES: OBJECTIVE 1")
+c1 <- cor_obj1 %>% filter(X == "logRMSSD_OFF", Y == "Pct_Frozen_OFF")
+p1a <- ggplot(df %>% filter(!is.na(logRMSSD_OFF), !is.na(Pct_Frozen_OFF)),
+              aes(logRMSSD_OFF, Pct_Frozen_OFF)) +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black", fill = "grey75", linewidth = 0.8, alpha = 0.5) +
+  geom_point(aes(colour = Participant_ID), size = 3.2, alpha = 0.95) +
+  pid_scale() +
+  labs(title = "Resting HRV vs Objective Freezing (OFF)",
+       subtitle = sprintf("Pearson r = %.2f (p = %s); Spearman rho = %.2f (p = %s); n = %d\nOLS fit with 95%% CI",
+                          c1$r, fmt_p(c1$r_p), c1$rho, fmt_p(c1$rho_p), c1$n),
+       x = "ln RMSSD, 5-min standing (OFF)", y = "% Time Frozen (OFF)") +
+  theme_pub()
+save_fig(p1a, "Fig1A_Aim1_logRMSSD_vs_PctFrozen_OFF.png", 8, 5.5)
+
+ms1_lab <- ms1 %>% filter(is.na(Note) | Note == "") %>%
+  transmute(Outcome, Label = sprintf("Welch p = %s\nMWU p = %s", fmt_p(Welch_p), fmt_p(MWU_p)))
+p1b_dat <- df %>%
+  select(Participant_ID, HRV_Group, Pct_Frozen_OFF, NFOG_Q, Giladi_OFF) %>%
+  pivot_longer(-c(Participant_ID, HRV_Group), names_to = "Outcome", values_to = "Value") %>%
+  filter(!is.na(Value), !is.na(HRV_Group)) %>%
+  mutate(Outcome = factor(Outcome, levels = c("Pct_Frozen_OFF", "NFOG_Q", "Giladi_OFF")))
+facet_lab1 <- as_labeller(var_labels[c("Pct_Frozen_OFF", "NFOG_Q", "Giladi_OFF")])
+p1b <- ggplot(p1b_dat, aes(HRV_Group, Value)) +
+  geom_boxplot(outlier.shape = NA, fill = "white", colour = "grey35", width = 0.55) +
+  geom_jitter(aes(colour = Participant_ID), width = 0.15, height = 0, size = 2.6, alpha = 0.9) +
+  geom_text(data = ms1_lab, aes(x = 1.5, y = Inf, label = Label), vjust = 1.3, size = 3, inherit.aes = FALSE) +
+  facet_wrap(~ Outcome, scales = "free_y", labeller = facet_lab1) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.25))) +
+  pid_scale() +
+  labs(title = "Freezing Severity by Baseline HRV (Median Split)",
+       subtitle = sprintf("Split at median ln RMSSD (OFF) = %.2f; boxplots show median & IQR", med_lr),
+       x = NULL, y = "Score") +
+  theme_pub()
+save_fig(p1b, "Fig1B_Aim1_MedianSplit_Boxplots.png", 10, 5.5)
+
+# 8. OBJECTIVE 2 - Within-Subject Levodopa Modulation --------------------------
+banner("OBJECTIVE 2: WITHIN-SUBJECT LEVODOPA MODULATION (OFF vs ON)")
+
+section("Primary Aim 2: Paired contrasts (Diff = ON - OFF)")
+paired_vars <- tribble(
+  ~off,             ~on,             ~label,
+  "logRMSSD_OFF",   "logRMSSD_ON",   "logRMSSD",
+  "RMSSD_OFF",      "RMSSD_ON",      "RMSSD",
+  "SDNN_OFF",       "SDNN_ON",       "SDNN",
+  "Pct_Frozen_OFF", "Pct_Frozen_ON", "Pct_Frozen",
+  "UPDRS_OFF",      "UPDRS_ON",      "UPDRS"
+)
+pc2 <- pmap_dfr(paired_vars, ~ paired_contrast(df, ..1, ..2, ..3))
+cat("Descriptives & normality of difference scores:\n")
+print_tbl(pc2 %>% select(Variable, n_pairs, M_OFF, SD_OFF, M_ON, SD_ON, M_Diff, SD_Diff, Diff_SW_W, Diff_SW_p, Diff_Normal))
+cat("\nInferential tests:\n")
+print_tbl(pc2 %>% select(Variable, n_pairs, t, df, t_p, Cohen_dz, W, W_p, Primary_Test))
+cat("  (Primary_Test = Wilcoxon when Shapiro-Wilk on Diff rejects normality; both tests reported regardless)\n")
+
+## Sub-Aim 2.b: autonomic-motor coupling of delta scores
+section("Sub-Aim 2.b: Delta coupling (delta = ON - OFF)")
+df <- df %>% mutate(delta_logRMSSD   = logRMSSD_ON - logRMSSD_OFF,
+                    delta_Pct_Frozen = Pct_Frozen_ON - Pct_Frozen_OFF)
+cor_delta <- cor_pair(df, "delta_logRMSSD", "delta_Pct_Frozen")
+print_tbl(cor_delta)
+
+section("Mahalanobis distance screening of bivariate deltas")
+dd <- df %>% select(Participant_ID, delta_logRMSSD, delta_Pct_Frozen) %>% drop_na()
+X <- as.matrix(dd[, c("delta_logRMSSD", "delta_Pct_Frozen")])
+md_cut <- qchisq(0.975, df = 2)
+dd <- dd %>% mutate(MD2 = mahalanobis(X, colMeans(X), cov(X)),
+                    MD2_p = pchisq(MD2, df = 2, lower.tail = FALSE),
+                    Outlier = MD2 > md_cut)
+cat(sprintf("  Cut-off: chi-square(2) 97.5th percentile = %.3f | n = %d\n", md_cut, nrow(dd)))
+print_tbl(dd %>% arrange(desc(MD2)) %>% slice_head(n = 6))
+cat("  A-priori checks:\n")
+print_tbl(dd %>% filter(Participant_ID %in% DELTA_A_PRIORI_PIDS))
+md_flag <- dd$Participant_ID[dd$Outlier]
+cat(sprintf("  Flagged bivariate outliers: %s\n", ifelse(length(md_flag), paste(md_flag, collapse = ", "), "none")))
+
+section("Delta coupling sensitivity")
+delta_sens <- bind_rows(
+  cor_delta %>% mutate(Cohort = "Full"),
+  if (length(md_flag)) cor_pair(df %>% filter(!Participant_ID %in% md_flag),
+                                "delta_logRMSSD", "delta_Pct_Frozen") %>%
+    mutate(Cohort = paste("Excl. MD flagged:", paste(md_flag, collapse = ", "))),
+  if (!setequal(md_flag, DELTA_A_PRIORI_PIDS))
+    cor_pair(df %>% filter(!Participant_ID %in% DELTA_A_PRIORI_PIDS), "delta_logRMSSD", "delta_Pct_Frozen") %>%
+      mutate(Cohort = paste("Excl. a-priori:", paste(DELTA_A_PRIORI_PIDS, collapse = ", ")))
+) %>% select(Cohort, n, r, r_p, rho, rho_p)
+print_tbl(delta_sens)
+
+## Figures - Aim 2
+banner("FIGURES: OBJECTIVE 2")
+slope_dat <- map_dfr(seq_len(nrow(paired_vars)), function(i) {
+  df %>% select(Participant_ID, OFF = all_of(paired_vars$off[i]), ON = all_of(paired_vars$on[i])) %>%
+    drop_na() %>% mutate(Variable = paired_vars$label[i])
+}) %>%
+  pivot_longer(c(OFF, ON), names_to = "State", values_to = "Value") %>%
+  mutate(State = factor(State, levels = c("OFF", "ON")))
+slope_labs <- pc2 %>%
+  transmute(Variable, Lab = sprintf("%s\npaired t p = %s | Wilcoxon p = %s | dz = %.2f",
+                                    var_labels[Variable], fmt_p(t_p), fmt_p(W_p), Cohen_dz))
+slope_dat <- slope_dat %>%
+  left_join(slope_labs, by = "Variable") %>%
+  mutate(Lab = factor(Lab, levels = slope_labs$Lab))
+
+p2a <- ggplot(slope_dat, aes(State, Value)) +
+  geom_line(aes(group = Participant_ID, colour = Participant_ID), alpha = 0.7, linewidth = 0.6) +
+  geom_point(aes(colour = Participant_ID), size = 2.2, alpha = 0.9) +
+  stat_summary(aes(group = 1), fun = mean, geom = "line", colour = "black", linewidth = 1.3) +
+  stat_summary(fun = mean, geom = "point", shape = 23, size = 4.8, fill = "gold", colour = "black", stroke = 1.1) +
+  facet_wrap(~ Lab, scales = "free_y", ncol = 3) +
+  pid_scale() +
+  labs(title = "Within-Subject Levodopa Modulation (OFF to ON)",
+       subtitle = "Lines: individual participants; gold diamonds: group means",
+       x = "Medication State", y = NULL) +
+  theme_pub(10) +
+  theme(strip.text = element_text(size = 8))
+save_fig(p2a, "Fig2A_Aim2_Paired_Slopegraphs.png", 12, 7.5)
+
+dd_plot <- dd %>% mutate(Label = ifelse(Outlier | Participant_ID %in% DELTA_A_PRIORI_PIDS, Participant_ID, NA))
+p2b <- ggplot(dd_plot, aes(delta_logRMSSD, delta_Pct_Frozen)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  geom_smooth(method = "lm", formula = y ~ x, colour = "black", fill = "grey75", linewidth = 0.8, alpha = 0.5) +
+  geom_point(aes(colour = Participant_ID), size = 3.2) +
+  geom_point(data = filter(dd_plot, Outlier), shape = 21, size = 6, stroke = 1.1, colour = "red") +
+  geom_text(aes(label = Label), na.rm = TRUE, vjust = -1.1, size = 3, fontface = "bold") +
+  pid_scale() +
+  labs(title = "Autonomic-Motor Coupling of Levodopa Response",
+       subtitle = sprintf("Pearson r = %.2f (p = %s); Spearman rho = %.2f (p = %s); n = %d\nRed rings: Mahalanobis outliers (D^2 > %.2f)",
+                          cor_delta$r, fmt_p(cor_delta$r_p), cor_delta$rho, fmt_p(cor_delta$rho_p),
+                          cor_delta$n, md_cut),
+       x = "Change in ln RMSSD (ON - OFF)", y = "Change in % Time Frozen (ON - OFF)") +
+  theme_pub()
+save_fig(p2b, "Fig2B_Aim2_Delta_Coupling.png", 8, 5.5)
+
+# 9. OBJECTIVE 3 - Disentangling Motor Propensity from Anxiety -----------------
+banner("OBJECTIVE 3: DISENTANGLING MOTOR PROPENSITY FROM ANXIETY")
+
+anx_vars <- names(ANX_CUTOFFS)
+section("Primary Aim 3: Resting HRV x anxiety correlations")
+cor_obj3 <- expand_grid(X = c("logRMSSD_OFF", "SDNN_OFF"), Y = anx_vars) %>%
+  pmap_dfr(~ cor_pair(df, .x, .y))
+print_tbl(cor_obj3)
+cat("\nAnxiety x freezing (context):\n")
+print_tbl(map_dfr(anx_vars, ~ cor_pair(df, .x, "Pct_Frozen_OFF")))
+
+section("Primary Aim 3: Anxiety-adjusted hierarchical regressions (outcome: Pct_Frozen_OFF)")
+hlr3_specs <- c(setNames(as.list(anx_vars), anx_vars), list(All_Anxiety = anx_vars))
+hlr3 <- imap(hlr3_specs, ~ run_hlr(df, "Pct_Frozen_OFF", .x, "logRMSSD_OFF", paste("Aim 3 HLR:", .y)))
+hlr3 <- compact(hlr3)
+
+section("Aim 3 summary: incremental variance of logRMSSD_OFF beyond anxiety")
+hlr3_sum <- map_dfr(hlr3, function(h) {
+  s1 <- h$fit[1, ]; s2 <- h$fit[2, ]
+  tibble(Step1 = s1$Predictors, n = s1$n, R2_Step1 = s1$R2, R2_Step2 = s2$R2,
+         dR2 = s2$dR2, F_change = s2$F_change, df1 = s2$df_change, df2 = s2$df2,
+         F_change_p = s2$F_change_p,
+         Verdict = ifelse(s2$F_change_p < ALPHA, "HRV adds unique variance", "n.s."))
+})
+print_tbl(hlr3_sum)
+
+section("Aim 3 model assumption checks (Step 2 models)")
+diag3 <- map_dfr(hlr3, ~ diag_lm(.x$m2, .x$data, .x$label, verbose = FALSE)$summary)
+print_tbl(diag3 %>% select(Model, n, SW_p, Normality, BP_p, Homoscedasticity, Max_VIF, Collinearity, Cook_flagged))
+
+## Sub-Aim 3.b: High vs Low anxiety cohorts
+section("Sub-Aim 3.b: High (HA) vs Low (LA) anxiety cohorts")
+for (v in anx_vars) {
+  df[[paste0(v, "_Group")]] <- factor(ifelse(df[[v]] >= ANX_CUTOFFS[[v]], "HA", "LA"), levels = c("LA", "HA"))
+}
+grp_n <- map_dfr(anx_vars, function(v) {
+  g <- df[[paste0(v, "_Group")]]
+  tibble(Measure = v, Cutoff = paste0(">= ", ANX_CUTOFFS[[v]]),
+         n_LA = sum(g == "LA", na.rm = TRUE), n_HA = sum(g == "HA", na.rm = TRUE), n_missing = sum(is.na(g)),
+         HA_PIDs = paste(df$Participant_ID[g %in% "HA"], collapse = ", "))
+})
+print_tbl(grp_n)
+cat("\n")
+anx3 <- expand_grid(Grouping = paste0(anx_vars, "_Group"), Outcome = c("logRMSSD_OFF", "Pct_Frozen_OFF")) %>%
+  pmap_dfr(~ compare_groups(df, .x, .y))
+print_tbl(anx3 %>% select(-Groups))
+cat("  (g1 = LA, g2 = HA; Cohen's d = (LA - HA) / pooled SD)\n")
+
+## Figures - Aim 3
+banner("FIGURES: OBJECTIVE 3")
+anx_lab_map <- setNames(sprintf("%s (HA >= %s)", var_labels[anx_vars], ANX_CUTOFFS), paste0(anx_vars, "_Group"))
+p3_dat <- df %>%
+  select(Participant_ID, logRMSSD_OFF, Pct_Frozen_OFF, all_of(paste0(anx_vars, "_Group"))) %>%
+  pivot_longer(all_of(paste0(anx_vars, "_Group")), names_to = "Grouping", values_to = "Group") %>%
+  pivot_longer(c(logRMSSD_OFF, Pct_Frozen_OFF), names_to = "Outcome", values_to = "Value") %>%
+  filter(!is.na(Group), !is.na(Value)) %>%
+  mutate(Measure = factor(anx_lab_map[Grouping], levels = anx_lab_map),
+         Outcome_Lab = factor(var_labels[Outcome], levels = var_labels[c("logRMSSD_OFF", "Pct_Frozen_OFF")]))
+p3_lab <- anx3 %>% filter(is.na(Note) | Note == "") %>%
+  transmute(Measure = factor(anx_lab_map[Grouping], levels = anx_lab_map),
+            Outcome_Lab = factor(var_labels[Outcome], levels = levels(p3_dat$Outcome_Lab)),
+            Label = sprintf("Welch p = %s\nMWU p = %s", fmt_p(Welch_p), fmt_p(MWU_p)))
+p3 <- ggplot(p3_dat, aes(Group, Value)) +
+  geom_boxplot(aes(fill = Group), outlier.shape = NA, colour = "grey30", width = 0.55, alpha = 0.35) +
+  geom_jitter(aes(colour = Participant_ID), width = 0.15, height = 0, size = 2.4, alpha = 0.9) +
+  geom_text(data = p3_lab, aes(x = 1.5, y = Inf, label = Label), vjust = 1.3, size = 2.8, inherit.aes = FALSE) +
+  facet_grid(Outcome_Lab ~ Measure, scales = "free_y", switch = "y") +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.3))) +
+  scale_fill_manual(values = c(LA = "#4DAF4A", HA = "#E41A1C"), name = "Cohort",
+                    labels = c(LA = "Low anxiety", HA = "High anxiety")) +
+  pid_scale() +
+  labs(title = "Resting HRV and Freezing by Anxiety Cohort (OFF)",
+       subtitle = "Clinical cut-offs: STAI-Trait >= 40, STAI-State >= 40, HADS-A >= 8; boxplots show median & IQR",
+       x = NULL, y = NULL) +
+  theme_pub(10) +
+  theme(strip.placement = "outside")
+save_fig(p3, "Fig3_Aim3_Anxiety_Cohort_Boxplots.png", 12, 7.5)
+
+# 10. Wrap-up ------------------------------------------------------------------
+banner("RUN COMPLETE")
+cat(sprintf("Analytic cohort n = %d | Results directory: %s\n", nrow(df), RESULTS_DIR))
+cat("Outputs:\n")
+for (f in sort(list.files(RESULTS_DIR))) cat("  -", f, "\n")
