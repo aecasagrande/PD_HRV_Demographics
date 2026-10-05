@@ -1,0 +1,246 @@
+# ==============================================================================
+# SCRIPT 1: DEMOGRAPHICS & CLINICAL CHARACTERISTICS PROFILE
+# ==============================================================================
+# - Merges Demographics, Cognitive, Motor UPDRS, and Questionnaires
+# - Generates Table 1 (All Participants and Excluding P-007) via gtsummary
+# - Produces clinical cut-off boxplots with individual jitter points
+# - Prints a participant-by-participant missing data audit to the terminal
+# ==============================================================================
+
+# 1. Packages ------------------------------------------------------------------
+needed_pkgs <- c("readxl", "tidyverse", "lubridate", "gtsummary", 
+                 "RColorBrewer", "gridExtra", "grid")
+to_install <- needed_pkgs[!vapply(needed_pkgs, requireNamespace, logical(1), quietly = TRUE)]
+if (length(to_install)) install.packages(to_install, repos = "https://cloud.r-project.org")
+
+suppressPackageStartupMessages({
+  library(readxl)
+  library(tidyverse)
+  library(lubridate)
+  library(gtsummary)
+  library(RColorBrewer)
+  library(gridExtra)
+  library(grid)
+})
+
+# 2. File Paths ----------------------------------------------------------------
+DATA_DIR <- "/Users/aecasagr/Desktop/PD_HRV/Data"
+F_DEMO   <- file.path(DATA_DIR, "01_Demographics.xlsx")
+F_COG    <- file.path(DATA_DIR, "02_Cognitive.xlsx")
+F_UPDRS  <- file.path(DATA_DIR, "03_Motor_UPDRS-III.xlsx")
+F_GILADI <- file.path(DATA_DIR, "04_Freezing_Giladi.xlsx")
+F_HOME   <- file.path(DATA_DIR, "06_Home_Questionnaires.xlsx")
+
+# 3. Load & Process ------------------------------------------------------------
+cat("\n============================================================\n")
+cat(" LOADING & MERGING DEMOGRAPHIC & CLINICAL DATA\n")
+cat("============================================================\n")
+
+# Demographics (drop summary rows by matching PID format P-XXX)
+raw_demo <- read_excel(F_DEMO, sheet = "Demographics") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  rename(Participant_ID = participant_id)
+
+# Cognitive
+raw_cog <- read_excel(F_COG, sheet = "Cognitive") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  rename(Participant_ID = participant_id)
+
+# UPDRS-III
+raw_updrs <- read_excel(F_UPDRS, sheet = "UPDRS-III") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  rename(Participant_ID = participant_id)
+
+# Clinical Giladi Summary
+raw_giladi <- read_excel(F_GILADI, sheet = "Summary") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  rename(Participant_ID = participant_id)
+
+# Home Questionnaires
+raw_home <- read_excel(F_HOME, sheet = "Summary") %>%
+  filter(grepl("^P-\\d{3}$", participant_id)) %>%
+  rename(Participant_ID = participant_id)
+
+# Merge Master Demographic Dataset
+df_demo <- raw_demo %>%
+  transmute(
+    Participant_ID,
+    Sex = factor(`Gender (self-report)`),
+    Age = as.numeric(`Age (years)`),
+    Disease_Duration = as.numeric(`Disease duration (years since diagnosis)`),
+    Symptom_Duration = as.numeric(`Symptom duration (years)`),
+    LEDD = as.numeric(LEDD_total_mg),
+    BMI = as.numeric(`BMI (kg/m2)`)
+  ) %>%
+  left_join(raw_cog %>% transmute(
+    Participant_ID,
+    MoCA = as.numeric(`MoCA (/30)`),
+    TMT_A = as.numeric(`TMT-A (s)`),
+    TMT_B = as.numeric(`TMT-B (s)`),
+    dTMT  = as.numeric(`TMT B - A (s)`)
+  ), by = "Participant_ID") %>%
+  left_join(raw_updrs %>% transmute(
+    Participant_ID,
+    UPDRS_OFF = as.numeric(`UPDRS-III OFF`),
+    UPDRS_ON  = as.numeric(`UPDRS-III ON`)
+  ), by = "Participant_ID") %>%
+  left_join(raw_giladi %>% transmute(
+    Participant_ID,
+    Giladi_OFF = as.numeric(`OFF Total sum`),
+    Giladi_ON  = as.numeric(`ON Total sum`)
+  ), by = "Participant_ID") %>%
+  left_join(raw_home %>% transmute(
+    Participant_ID,
+    NFOG_Q = as.numeric(`NFOG-Q total`),
+    STAI_Trait = as.numeric(`STAI-Trait total`)
+  ), by = "Participant_ID")
+
+cat(sprintf("Loaded %d participants from demographic roster.\n", nrow(df_demo)))
+
+# 4. Generate Table 1 (gtsummary) ---------------------------------------------
+theme_gtsummary_journal(journal = "jama")
+
+table_types <- list(
+  c(Age, Disease_Duration, Symptom_Duration, LEDD, BMI, MoCA, 
+    TMT_A, TMT_B, dTMT, UPDRS_OFF, UPDRS_ON, Giladi_OFF, Giladi_ON, 
+    NFOG_Q, STAI_Trait) ~ "continuous"
+)
+
+table_labels <- list(
+  Sex ~ "Sex",
+  Age ~ "Age (years)",
+  Disease_Duration ~ "Disease Duration (years)",
+  Symptom_Duration ~ "Symptom Duration (years)",
+  LEDD ~ "Total LEDD (mg/day)",
+  BMI ~ "BMI (kg/m²)",
+  MoCA ~ "MoCA Score (/30)",
+  TMT_A ~ "Trail Making Test A (s)",
+  TMT_B ~ "Trail Making Test B (s)",
+  dTMT ~ "TMT B − A (ΔTMT, s)",
+  UPDRS_OFF ~ "MDS-UPDRS Part III (OFF Med)",
+  UPDRS_ON ~ "MDS-UPDRS Part III (ON Med)",
+  Giladi_OFF ~ "Giladi FOG Total Sum (OFF)",
+  Giladi_ON ~ "Giladi FOG Total Sum (ON)",
+  NFOG_Q ~ "NFOG-Q Total Score",
+  STAI_Trait ~ "STAI-Trait Anxiety Score"
+)
+
+stat_template <- "{mean} ± {sd} (SE: {se}); Range: {min} – {max}"
+
+table_1_all <- df_demo %>%
+  select(-Participant_ID) %>%
+  tbl_summary(
+    statistic = list(all_continuous() ~ stat_template, all_categorical() ~ "{n} ({p}%)"),
+    type = table_types, label = table_labels, missing_text = "Missing"
+  ) %>%
+  modify_header(label = "**Characteristic**") %>%
+  modify_caption("**Table 1. Demographic & Clinical Characteristics (All Participants)**") %>%
+  bold_labels()
+
+table_1_filtered <- df_demo %>%
+  filter(Participant_ID != "P-007") %>%
+  select(-Participant_ID) %>%
+  tbl_summary(
+    statistic = list(all_continuous() ~ stat_template, all_categorical() ~ "{n} ({p}%)"),
+    type = table_types, label = table_labels, missing_text = "Missing"
+  ) %>%
+  modify_header(label = "**Characteristic**") %>%
+  modify_caption("**Table 1. Demographic & Clinical Characteristics (Excluding P-007)**") %>%
+  bold_labels()
+
+# Print Table 1 to terminal
+cat("\n\n============================================================\n")
+cat(" TABLE 1: DEMOGRAPHICS (ALL PARTICIPANTS)\n")
+cat("============================================================\n")
+print(as_tibble(table_1_all), n = Inf, width = Inf)
+
+cat("\n\n============================================================\n")
+cat(" TABLE 1: DEMOGRAPHICS (EXCLUDING P-007)\n")
+cat("============================================================\n")
+print(as_tibble(table_1_filtered), n = Inf, width = Inf)
+
+# 5. Missing Data Audit --------------------------------------------------------
+cat("\n\n============================================================\n")
+cat(" MISSING DATA AUDIT BY VARIABLE\n")
+cat("============================================================\n")
+missing_audit <- df_demo %>%
+  filter(Participant_ID != "P-007") %>%
+  pivot_longer(-Participant_ID, names_to = "Variable", values_to = "Val") %>%
+  group_by(Variable) %>%
+  summarise(
+    Missing_Count = sum(is.na(Val)),
+    Missing_PIDs  = ifelse(any(is.na(Val)), paste(Participant_ID[is.na(Val)], collapse = ", "), "Complete"),
+    .groups = "drop"
+  )
+print(as.data.frame(missing_audit), row.names = FALSE)
+
+# 6. Clinical Cutoff Boxplots with Individual Data Points ----------------------
+plot_vars <- c(
+  Age = "Age\n(years)",
+  Disease_Duration = "Disease Duration\n(years)",
+  LEDD = "Total LEDD\n(mg/day)",
+  MoCA = "MoCA Score\n(ON Med)",
+  TMT_A = "TMT-A\n(seconds)",
+  TMT_B = "TMT-B\n(seconds)",
+  dTMT = "TMT B−A\n(ΔTMT, s)",
+  UPDRS_OFF = "UPDRS-III\n(OFF Med)",
+  UPDRS_ON = "UPDRS-III\n(ON Med)",
+  NFOG_Q = "NFOG-Q\n(Total)",
+  STAI_Trait = "STAI-Trait\n(Total)"
+)
+
+clinical_cutoffs <- tribble(
+  ~Variable, ~ymin, ~ymax, ~Status,
+  "MoCA Score\n(ON Med)", 25.5, Inf, "Normal",
+  "MoCA Score\n(ON Med)", 17.5, 25.5, "Mild",
+  "MoCA Score\n(ON Med)", 9.5, 17.5, "Moderate",
+  "MoCA Score\n(ON Med)", -Inf, 9.5, "Severe",
+  "TMT-A\n(seconds)", -Inf, 39.5, "Normal",
+  "TMT-A\n(seconds)", 39.5, Inf, "Severe",
+  "TMT-B\n(seconds)", -Inf, 91.5, "Normal",
+  "TMT-B\n(seconds)", 91.5, Inf, "Severe",
+  "UPDRS-III\n(OFF Med)", -Inf, 32.5, "Mild",
+  "UPDRS-III\n(OFF Med)", 32.5, 58.5, "Moderate",
+  "UPDRS-III\n(OFF Med)", 58.5, Inf, "Severe",
+  "UPDRS-III\n(ON Med)", -Inf, 32.5, "Mild",
+  "UPDRS-III\n(ON Med)", 32.5, 58.5, "Moderate",
+  "UPDRS-III\n(ON Med)", 58.5, Inf, "Severe"
+) %>%
+  mutate(Variable = factor(Variable, levels = plot_vars),
+         Status = factor(Status, levels = c("Normal", "Mild", "Moderate", "Severe")))
+
+pids <- sort(unique(df_demo$Participant_ID))
+pid_cols <- setNames(colorRampPalette(brewer.pal(min(length(pids), 12), "Paired"))(length(pids)), pids)
+
+df_plot_long <- df_demo %>%
+  filter(Participant_ID != "P-007") %>%
+  select(Participant_ID, any_of(names(plot_vars))) %>%
+  pivot_longer(-Participant_ID, names_to = "Var_Key", values_to = "Value") %>%
+  filter(!is.na(Value)) %>%
+  mutate(Variable = factor(recode(Var_Key, !!!plot_vars), levels = plot_vars))
+
+p_demo <- ggplot(df_plot_long, aes(x = "", y = Value)) +
+  geom_rect(data = clinical_cutoffs, aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax, fill = Status),
+            inherit.aes = FALSE, alpha = 0.22) +
+  geom_boxplot(outlier.shape = NA, fill = "white", colour = "grey35", width = 0.5, linewidth = 0.5, alpha = 0.8) +
+  geom_jitter(aes(colour = Participant_ID), width = 0.16, size = 2.6, alpha = 0.9, shape = 16) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 4) +
+  scale_colour_manual(values = pid_cols, name = "Participant") +
+  scale_fill_manual(values = c("Normal" = "#7fc97f", "Mild" = "#ffff99", 
+                               "Moderate" = "#fdc086", "Severe" = "#f0027f"),
+                    name = "Clinical Cutoff", drop = FALSE) +
+  labs(title = "Clinical & Demographic Cohort Distributions (Excluding P-007)",
+       subtitle = "Boxplots represent median & IQR; points display individual participant data",
+       x = NULL, y = "Score / Units") +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13, hjust = 0.5),
+    plot.subtitle = element_text(size = 9.5, hjust = 0.5, colour = "grey30"),
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text = element_text(face = "bold", size = 8.5),
+    strip.background = element_rect(fill = "grey95"),
+    panel.grid.major.x = element_blank()
+  )
+
+print(p_demo)
