@@ -1,0 +1,10 @@
+# Participant-level source data: keep out of version control
+Data/
+*.xlsx
+~$*
+
+# R session artefacts
+.Rhistory
+.RData
+.Rproj.user/
+Rplots.pdf
